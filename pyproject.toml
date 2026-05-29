@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-applyspectrallock"
+version = "1.0.0"
+description = "ApplySpectralLock — latent spectral handoff for Flux.1 / Rectified Flow and USDU tiled upscaling."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ComfyUI-ApplySpectralLock contributors" }]
+dependencies = ["torch"]
+
+[project.urls]
+Repository = "https://github.com/REPLACE_ME/ComfyUI-ApplySpectralLock"
+
+# Comfy Registry (optional): https://docs.comfy.org/registry/overview
+[tool.comfy]
+PublisherId = "REPLACE_ME"
+DisplayName = "ApplySpectralLock"
+Icon = ""

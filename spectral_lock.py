@@ -6,9 +6,11 @@ high (H) frequency bands. Two decoupled controls are then applied:
 
   * Structure lock (alpha): low frequencies are anchored to a reference latent.
     Active from step 0 to preserve composition / color / lighting.
-  * Detail gate (gamma, cosine envelope): the high frequencies are scaled by a
-    robust channel-wise std ratio (clamped to [0.1, 3.0] to prevent contrast
-    blowouts) toward the reference's energy, then dampened by the cosine envelope.
+  * Detail gate (gamma, cosine envelope): attenuate-only grain suppression. A single
+    per-tile scalar (reduced over all channels, so color/tone is preserved) scales the
+    high band DOWN toward the reference energy when the tile is grainier than the
+    reference, and never amplifies. Flat reference tiles are left untouched to avoid
+    per-tile gain differences (seams). Engages over the final steps via the cosine gate.
 
 Latent-space normalized cross-correlation aligns USDU sub-tiles to the reference,
 and a cosine spatial edge-taper forces the adjustment to zero at tile borders so
@@ -158,7 +160,7 @@ class SpectralLockPatcher:
                 "alpha_lock": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "gamma_max": ("FLOAT", {"default": 0.70, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "decay_type": (["cosine", "linear"],),
-                "edge_taper": ("INT", {"default": 48, "min": 0, "max": 256, "step": 1}),
+                "edge_taper": ("INT", {"default": 8, "min": 0, "max": 256, "step": 1}),
             }
         }
 
@@ -176,7 +178,7 @@ class SpectralLockPatcher:
         alpha_lock: float,
         gamma_max: float,
         decay_type: str,
-        edge_taper: int = 48,
+        edge_taper: int = 8,
     ) -> Tuple[Any]:
         m = model.clone()
         X_orig_full = latent_orig["samples"]
@@ -300,24 +302,29 @@ class SpectralLockPatcher:
             alpha = float(alpha_lock)
             L_new = (L_orig_tile * alpha) + (L_t * (1.0 - alpha))
 
-            # --- Robust instance variance matching (channel-wise std) ---
-            # 1. Get the original high frequencies for this tile
+            # --- Detail gate: attenuate-only, color-safe grain suppression ---
+            # Goal: remove *excess* high-frequency energy (grain/overshoot) without
+            # manufacturing contrast. We therefore only ever scale H DOWN, never up,
+            # and use a single per-tile scalar (reduced over channels too) so the
+            # inter-channel balance -- i.e. color/tone -- is preserved.
             H_orig = X_orig_cropped - L_orig_tile
+            std_orig = H_orig.to(torch.float32).std(dim=[1, 2, 3], keepdim=True)
+            std_t = H_t.to(torch.float32).std(dim=[1, 2, 3], keepdim=True)
 
-            # 2. Calculate stable standard deviations per channel
-            # Shape will be [B, 16, 1, 1]
-            std_orig = H_orig.to(torch.float32).std(dim=[2, 3], keepdim=True)
-            std_t = H_t.to(torch.float32).std(dim=[2, 3], keepdim=True)
+            # Ratio < 1 only when the generated tile is grainier than the reference.
+            # Clamped to <= 1.0: we suppress excess energy but never amplify (no deep-fry).
+            gain = torch.clamp(std_orig / (std_t + 1e-3), max=1.0)
 
-            # 3. Robust Variance Normalization (Prevents pixelation blowout)
-            # We scale the current high frequencies to match the original's energy
-            variance_scale = std_orig / (std_t + 1e-4)
+            # Flat-region guard: if the reference tile is essentially textureless
+            # (studio backdrop), leave it untouched. This keeps every tile identical in
+            # flat areas, eliminating the per-tile gain differences that cause seams.
+            flat = std_orig < 1e-2
+            gain = torch.where(flat, torch.ones_like(gain), gain)
 
-            # Clamp the scale to prevent extreme contrast spikes on flat areas
-            variance_scale = torch.clamp(variance_scale, min=0.1, max=3.0)
-
-            # 4. Apply the scale and the cosine dampener
-            H_new = H_t * variance_scale.to(dtype) * (1.0 - gamma_t)
+            # Cosine gate: no change early (gamma_t~0), full suppression late.
+            # multiplier = 1 - gamma_t * (1 - gain)  in [gain, 1].
+            multiplier = (1.0 - gamma_t * (1.0 - gain)).to(dtype)
+            H_new = H_t * multiplier
 
             # --- Spatial edge-gating (FIX 3) ---
             # Force the entire spectral adjustment to zero at the absolute tile border

@@ -60,4 +60,4 @@ The hook is registered with **`disable_cfg1_optimization=True`** so the post-CFG
 
 ## License
 
-MIT (replace if you use a different license for your repo).
+[MIT](LICENSE) (c) 2026 lookuters22.

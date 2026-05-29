@@ -9,14 +9,14 @@ description = "ApplySpectralLock — latent spectral handoff for Flux.1 / Rectif
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "ComfyUI-ApplySpectralLock contributors" }]
+authors = [{ name = "lookuters22" }]
 dependencies = ["torch"]
 
 [project.urls]
-Repository = "https://github.com/REPLACE_ME/ComfyUI-ApplySpectralLock"
+Repository = "https://github.com/lookuters22/ComfyUI-ApplySpectralLock"
 
 # Comfy Registry (optional): https://docs.comfy.org/registry/overview
 [tool.comfy]
-PublisherId = "REPLACE_ME"
+PublisherId = "lookuters22"
 DisplayName = "ApplySpectralLock"
 Icon = ""

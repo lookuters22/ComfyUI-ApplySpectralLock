@@ -34,7 +34,8 @@ Restart ComfyUI.
 | `kernel_size` | Odd kernel size for separable Gaussian low-pass (default 15). |
 | `blur_sigma` | Gaussian sigma for the 1D kernels (default 3.0). |
 | `alpha_lock` | Structure lock: blend weight for anchoring low frequencies to `latent_orig` (0–1, default 0.85). Active from step 0. |
-| `gamma_max` | Detail gate: maximum strength of high-frequency variance matching toward the reference (0–1, default 0.70). Higher = texture energy pulled harder toward the original (less grain). |
+| `gamma_max` | Detail gate: maximum blend toward the soft-clipped high band over the final steps (0–1, default 0.70). Higher = stronger grain suppression. |
+| `clip_k` | Soft-clip knee in units of the high-band sigma (default 2.0). Spikes beyond `k*sigma` are tamed; ordinary detail (`|H| << knee`) passes through. Lower = more aggressive grain removal; higher = gentler / more detail kept. |
 | `decay_type` | `cosine` (default, slow start then firm asymptote) or `linear` progress scaling for the detail gate. |
 | `edge_taper` | Spatial edge-gating width in latent cells (default 48, `0` disables). The spectral adjustment is cosine-tapered to zero at the tile border so USDU seam blending sees no discontinuity. Auto-clamped to half the tile size. |
 
@@ -51,8 +52,7 @@ The hook is registered with **`disable_cfg1_optimization=True`** so the post-CFG
 ## Implementation notes
 
 - **Depthwise separable** Gaussian: two `F.conv2d` passes with `groups=16`, **`F.pad(..., mode='reflect')`** before each pass.
-- **HF variance matching**: per-channel spatial std of the reference high-band is cached once per tile; the generated high-band is rescaled by `std_orig / (std_t + eps)` and blended in via the cosine gate. A gain clamp prevents runaway amplification on flat patches.
-- **Covariance-preserving (joint) epsilon**: the denominator floor is tied to the *mean energy across the 16 channels* (`eps_abs + eps_rel * mean_c(std_t)`), not to each channel in isolation. Near-flat channels inherit the joint floor instead of being independently amplified, keeping inter-channel scale ratios stable and preventing microscopic color/tonal drift (and division-by-zero on studio backdrops).
+- **Detail-preserving grain suppression**: the high band is soft-clipped with a `tanh` knee at `clip_k * sigma`. Grain/"deep-fry" is sparse extreme spikes, so clipping tames them while ordinary structured detail (`|H| << knee`) passes through unchanged — it does NOT normalize energy toward the reference (which would blur detail down to a soft base).
 - **Spatial edge-gating**: a cached cosine taper mask zeroes the spectral delta `(X_new - denoised)` at tile borders (`edge_taper`), so USDU seam blending never reconciles a discontinuity introduced here.
 - **Decoupled envelopes**: structure lock (`alpha`) is applied every step; the variance gate (`gamma`) ramps with schedule progress.
 - **Float32** for blur / variance / NCC internals; outputs are cast back to **`denoised.dtype`** and device.

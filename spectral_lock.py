@@ -6,11 +6,9 @@ high (H) frequency bands. Two decoupled controls are then applied:
 
   * Structure lock (alpha): low frequencies are anchored to a reference latent.
     Active from step 0 to preserve composition / color / lighting.
-  * Detail gate (gamma, cosine envelope): instead of blanket dampening, the high
-    frequencies are *variance matched* to the reference's per-channel energy, so
-    generated texture keeps real detail while the solver is prevented from
-    overshooting into digital grain. Engages mostly over the final steps. A joint
-    (cross-channel) epsilon keeps per-channel scaling coherent to avoid color drift.
+  * Detail gate (gamma, cosine envelope): the high frequencies are scaled by a
+    robust channel-wise std ratio (clamped to [0.1, 3.0] to prevent contrast
+    blowouts) toward the reference's energy, then dampened by the cosine envelope.
 
 Latent-space normalized cross-correlation aligns USDU sub-tiles to the reference,
 and a cosine spatial edge-taper forces the adjustment to zero at tile borders so
@@ -187,7 +185,7 @@ class SpectralLockPatcher:
             "max_sigma": None,
             "gaussian_filter": None,
             "cached_L_orig": None,
-            "cached_H_orig_std": None,
+            "cached_X_orig_cropped": None,
             "cached_edge_mask": None,
             "cached_tile_shape": None,
             "last_sigma": None,
@@ -215,7 +213,7 @@ class SpectralLockPatcher:
             if is_new_run:
                 state["max_sigma"] = None
                 state["cached_L_orig"] = None
-                state["cached_H_orig_std"] = None
+                state["cached_X_orig_cropped"] = None
                 state["cached_edge_mask"] = None
                 state["cached_tile_shape"] = None
             state["last_sigma"] = sigma_val
@@ -260,11 +258,9 @@ class SpectralLockPatcher:
                 oh, ow = int(X_orig.shape[2]), int(X_orig.shape[3])
 
                 if oh > h or ow > w:
-                    input_noisy = args.get("input")
-                    if isinstance(input_noisy, torch.Tensor) and input_noisy.shape == denoised.shape:
-                        y_off, x_off = _find_tile_offset_ncc(X_orig, input_noisy)
-                    else:
-                        y_off, x_off = 0, 0
+                    # FIX 1: match against the clean denoised output, not args["input"]
+                    # (the noisy latent), which gives unstable/random crop coordinates.
+                    y_off, x_off = _find_tile_offset_ncc(X_orig, denoised)
                     y_end = min(y_off + h, oh)
                     x_end = min(x_off + w, ow)
                     y_off = max(0, y_end - h)
@@ -282,12 +278,10 @@ class SpectralLockPatcher:
                     ).to(dtype=dtype)
 
                 L_orig = gaussian(X_orig_cropped)
-                # High-frequency residual of the reference tile and its per-channel
-                # spatial energy (std). Computed once per tile in fp32 for stability.
-                H_orig_32 = (X_orig_cropped.to(torch.float32) - L_orig.to(torch.float32))
-                H_orig_std = H_orig_32.std(dim=(2, 3), keepdim=True, unbiased=False)
+                # Cache the aligned reference tile and its low-pass; the high-frequency
+                # std is recomputed per step in the robust variance-matching block.
                 state["cached_L_orig"] = L_orig.to(dtype=dtype)
-                state["cached_H_orig_std"] = H_orig_std  # keep in fp32
+                state["cached_X_orig_cropped"] = X_orig_cropped.to(dtype=dtype)
                 # Cosine edge-taper mask for this tile geometry (fp32, broadcast over C).
                 state["cached_edge_mask"] = _build_edge_taper_mask(
                     h, w, int(edge_taper), device, torch.float32
@@ -297,8 +291,8 @@ class SpectralLockPatcher:
             L_t = gaussian(denoised).to(dtype=dtype)
             H_t = denoised - L_t
             L_orig_tile = state["cached_L_orig"]
-            H_orig_std = state["cached_H_orig_std"]
-            if L_orig_tile is None or H_orig_std is None:
+            X_orig_cropped = state["cached_X_orig_cropped"]
+            if L_orig_tile is None or X_orig_cropped is None:
                 return denoised
 
             # --- Structure lock (decoupled): fully active from step 0 ---
@@ -306,48 +300,41 @@ class SpectralLockPatcher:
             alpha = float(alpha_lock)
             L_new = (L_orig_tile * alpha) + (L_t * (1.0 - alpha))
 
-            # --- Detail gate (decoupled): variance matching governed by gamma_t ---
-            # Instead of shrinking high-frequency energy, renormalize the generated
-            # texture so its per-channel contrast/energy matches the reference latent.
-            # This preserves real detail while preventing the Euler solver from
-            # overshooting into digital grain. The cosine envelope (gamma_t) controls
-            # how strongly this governance engages, ramping up over the final steps.
-            H_t_32 = H_t.to(torch.float32)
-            std_t = H_t_32.std(dim=(2, 3), keepdim=True, unbiased=False)
+            # --- Robust instance variance matching (channel-wise std) ---
+            # 1. Get the original high frequencies for this tile
+            H_orig = X_orig_cropped - L_orig_tile
 
-            # Covariance-preserving (joint) epsilon: tie the denominator floor to the
-            # mean energy ACROSS the 16 channels, not to each channel in isolation. A
-            # near-flat channel therefore inherits the joint floor instead of being
-            # independently amplified, which keeps the inter-channel scale ratios stable
-            # and prevents microscopic color/tonal drift in the Flux latent.
-            eps_abs = 1e-4
-            eps_rel = 0.10
-            joint_energy = std_t.mean(dim=1, keepdim=True)  # [B,1,1,1] across channels
-            eps_joint = eps_abs + eps_rel * joint_energy
-            scale = H_orig_std / (std_t + eps_joint)
-            # Clamp the gain so a near-flat generated tile can't be blown up into noise.
-            scale = torch.clamp(scale, max=10.0)
+            # 2. Calculate stable standard deviations per channel
+            # Shape will be [B, 16, 1, 1]
+            std_orig = H_orig.to(torch.float32).std(dim=[2, 3], keepdim=True)
+            std_t = H_t.to(torch.float32).std(dim=[2, 3], keepdim=True)
 
-            H_matched = H_t_32 * scale
-            # Blend raw texture -> variance-matched texture as governance engages.
-            H_new = H_t_32 * (1.0 - gamma_t) + H_matched * gamma_t
-            H_new = H_new.to(dtype=dtype)
+            # 3. Robust Variance Normalization (Prevents pixelation blowout)
+            # We scale the current high frequencies to match the original's energy
+            variance_scale = std_orig / (std_t + 1e-4)
 
-            X_new = L_new + H_new
+            # Clamp the scale to prevent extreme contrast spikes on flat areas
+            variance_scale = torch.clamp(variance_scale, min=0.1, max=3.0)
 
-            # --- Spatial edge-gating ---
+            # 4. Apply the scale and the cosine dampener
+            H_new = H_t * variance_scale.to(dtype) * (1.0 - gamma_t)
+
+            # --- Spatial edge-gating (FIX 3) ---
             # Force the entire spectral adjustment to zero at the absolute tile border
-            # via a cosine taper, so USDU tile blending sees no seam discontinuity.
+            # via a cosine taper (fp32), so USDU tile blending sees no seam discontinuity.
+            combined = L_new + H_new
             edge_mask = state.get("cached_edge_mask")
             if edge_mask is not None:
                 if edge_mask.device != device:
                     edge_mask = edge_mask.to(device=device)
                     state["cached_edge_mask"] = edge_mask
-                delta = (X_new.to(torch.float32) - denoised.to(torch.float32)) * edge_mask
-                out = denoised.to(torch.float32) + delta
-                return out.to(dtype=dtype, device=device)
+                mask = edge_mask.to(torch.float32)
+                X_new = denoised.to(torch.float32) + (
+                    combined.to(torch.float32) - denoised.to(torch.float32)
+                ) * mask
+                return X_new.to(dtype=dtype, device=device)
 
-            return X_new.to(dtype=dtype, device=device)
+            return combined.to(dtype=dtype, device=device)
 
         model_options = dict(m.model_options)
         m.model_options = comfy.model_patcher.set_model_options_post_cfg_function(
